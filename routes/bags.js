@@ -1,8 +1,15 @@
 const express = require('express');
+const { body, validationResult } = require('express-validator');
 const { pool, flightId, parseFlightId, normalizeStatus } = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
+
+function validate(req, res) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+  return null;
+}
 
 function row2bag(b, history = []) {
   const code = b.airline_code ? b.airline_code.trim() : '';
@@ -89,28 +96,39 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 });
 
-router.post('/', authenticate, authorize('administrator', 'airline_staff'), async (req, res) => {
+const createBagValidation = [
+  body('bagId').trim().notEmpty().withMessage('bagId is required')
+    .isLength({ max: 50 }).withMessage('bagId too long')
+    .isAlphanumeric().withMessage('bagId must be alphanumeric'),
+  body('passengerId').trim().notEmpty().withMessage('passengerId is required')
+    .isLength({ max: 50 }).withMessage('passengerId too long'),
+  body('flightId').trim().notEmpty().withMessage('flightId is required'),
+  body('terminal').optional({ nullable: true }).trim().isLength({ max: 10 }).withMessage('terminal too long'),
+  body('counterNumber').optional({ nullable: true }).trim().isLength({ max: 10 }).withMessage('counterNumber too long'),
+];
+
+router.post('/', authenticate, authorize('administrator', 'airline_staff'), createBagValidation, async (req, res) => {
+  const err = validate(req, res);
+  if (err) return;
+
   const { bagId, passengerId, flightId: bodyFlightId, terminal, counterNumber } = req.body;
-  if (!bagId || !passengerId || !bodyFlightId) {
-    return res.status(400).json({ error: 'bagId, passengerId, and flightId are required' });
-  }
-  const parsed = parseFlightId(bodyFlightId);
+  const parsed = parseFlightId(bodyFlightId.trim());
   if (!parsed) return res.status(400).json({ error: 'Invalid flightId' });
 
   try {
-    const dup = await pool.query('SELECT 1 FROM bag WHERE bag_id = $1', [bagId]);
+    const dup = await pool.query('SELECT 1 FROM bag WHERE bag_id = $1', [bagId.trim()]);
     if (dup.rowCount) return res.status(409).json({ error: 'Bag ID already in use' });
 
     const passenger = await pool.query(
       'SELECT 1 FROM passenger WHERE ticket_number = $1',
-      [passengerId]
+      [passengerId.trim()]
     );
     if (passenger.rowCount === 0) return res.status(404).json({ error: 'Passenger not found' });
 
     await pool.query(
       `INSERT INTO bag (bag_id, ticket_number, airline_code, flight_number, terminal, counter_gate, status)
        VALUES ($1, $2, $3, $4, $5, $6, 'check_in')`,
-      [bagId, passengerId, parsed.airlineCode, parsed.flightNumber, terminal || null, counterNumber || null]
+      [bagId.trim(), passengerId.trim(), parsed.airlineCode, parsed.flightNumber, terminal || null, counterNumber || null]
     );
 
     const changedBy = req.user.staffId || null;
@@ -118,11 +136,11 @@ router.post('/', authenticate, authorize('administrator', 'airline_staff'), asyn
       await pool.query(
         `INSERT INTO bag_location_history (bag_id, airline_code, flight_number, terminal, counter_gate, status, changed_by)
          VALUES ($1, $2, $3, $4, $5, 'check_in', $6)`,
-        [bagId, parsed.airlineCode, parsed.flightNumber, terminal || null, counterNumber || null, changedBy]
+        [bagId.trim(), parsed.airlineCode, parsed.flightNumber, terminal || null, counterNumber || null, changedBy]
       );
     }
 
-    res.status(201).json(await fetchBag(bagId));
+    res.status(201).json(await fetchBag(bagId.trim()));
   } catch (err) {
     console.error('bags POST error:', err);
     res.status(500).json({ error: 'Internal error' });
@@ -141,13 +159,20 @@ router.delete('/:id', authenticate, authorize('administrator', 'airline_staff'),
   }
 });
 
-router.patch('/:id/location', authenticate, async (req, res) => {
+const updateLocationValidation = [
+  body('location').notEmpty().withMessage('location is required')
+    .isIn(['check_in', 'security', 'security_violation', 'gate', 'loaded']).withMessage('Invalid location'),
+  body('gateNumber').optional({ nullable: true }).trim().isLength({ max: 10 }).withMessage('gateNumber too long'),
+];
+
+router.patch('/:id/location', authenticate, updateLocationValidation, async (req, res) => {
   const allowed = ['administrator', 'airline_staff', 'gate_staff', 'ground_staff'];
   if (!allowed.includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
 
+  const err = validate(req, res);
+  if (err) return;
+
   const { location, gateNumber } = req.body;
-  const valid = ['check_in', 'security', 'security_violation', 'gate', 'loaded'];
-  if (!valid.includes(location)) return res.status(400).json({ error: 'Invalid location' });
 
   try {
     const before = await pool.query(

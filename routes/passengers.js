@@ -1,8 +1,15 @@
 const express = require('express');
+const { body, validationResult } = require('express-validator');
 const { pool, flightId, parseFlightId, normalizeStatus } = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
+
+function validate(req, res) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+  return null;
+}
 
 function row2passenger(p) {
   const code = p.airline_code ? p.airline_code.trim() : '';
@@ -55,12 +62,27 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 });
 
-router.post('/', authenticate, authorize('administrator', 'airline_staff'), async (req, res) => {
+const createPassengerValidation = [
+  body('firstName').trim().notEmpty().withMessage('firstName is required')
+    .isLength({ max: 50 }).withMessage('firstName too long')
+    .matches(/^[A-Za-z\s'-]+$/).withMessage('firstName contains invalid characters'),
+  body('lastName').trim().notEmpty().withMessage('lastName is required')
+    .isLength({ max: 50 }).withMessage('lastName too long')
+    .matches(/^[A-Za-z\s'-]+$/).withMessage('lastName contains invalid characters'),
+  body('identification').trim().notEmpty().withMessage('identification is required')
+    .isLength({ max: 100 }).withMessage('identification too long'),
+  body('ticketNumber').trim().notEmpty().withMessage('ticketNumber is required')
+    .isLength({ max: 50 }).withMessage('ticketNumber too long')
+    .isAlphanumeric().withMessage('ticketNumber must be alphanumeric'),
+  body('flightId').trim().notEmpty().withMessage('flightId is required'),
+];
+
+router.post('/', authenticate, authorize('administrator', 'airline_staff'), createPassengerValidation, async (req, res) => {
+  const err = validate(req, res);
+  if (err) return;
+
   const { firstName, lastName, identification, ticketNumber, flightId: bodyFlightId } = req.body;
-  if (!firstName || !lastName || !identification || !ticketNumber || !bodyFlightId) {
-    return res.status(400).json({ error: 'All fields are required' });
-  }
-  const parsed = parseFlightId(bodyFlightId);
+  const parsed = parseFlightId(bodyFlightId.trim());
   if (!parsed) return res.status(400).json({ error: 'Invalid flightId' });
 
   try {
@@ -72,19 +94,19 @@ router.post('/', authenticate, authorize('administrator', 'airline_staff'), asyn
 
     const dup = await pool.query(
       'SELECT 1 FROM passenger WHERE ticket_number = $1',
-      [ticketNumber]
+      [ticketNumber.trim()]
     );
     if (dup.rowCount) return res.status(409).json({ error: 'Ticket number already exists' });
 
     await pool.query(
       `INSERT INTO passenger (identification, airline_code, flight_number, ticket_number, firstname, lastname, status)
        VALUES ($1, $2, $3, $4, $5, $6, 'not_checked_in')`,
-      [identification, parsed.airlineCode, parsed.flightNumber, ticketNumber, firstName, lastName]
+      [identification.trim(), parsed.airlineCode, parsed.flightNumber, ticketNumber.trim(), firstName.trim(), lastName.trim()]
     );
 
     const { rows } = await pool.query(
       'SELECT * FROM passenger WHERE ticket_number = $1',
-      [ticketNumber]
+      [ticketNumber.trim()]
     );
     res.status(201).json(row2passenger(rows[0]));
   } catch (err) {

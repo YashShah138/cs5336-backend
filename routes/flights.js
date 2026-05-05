@@ -1,8 +1,15 @@
 const express = require('express');
+const { body, validationResult } = require('express-validator');
 const { pool, flightId, parseFlightId, normalizeStatus } = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
+
+function validate(req, res) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+  return null;
+}
 
 function row2flight(f) {
   const code = f.airline_code ? f.airline_code.trim() : '';
@@ -50,17 +57,28 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 });
 
-router.post('/', authenticate, authorize('administrator'), async (req, res) => {
-  const { airlineCode, flightNumber, destination, terminal, gate } = req.body;
-  if (!airlineCode || !flightNumber || !terminal || !gate) {
-    return res.status(400).json({ error: 'airlineCode, flightNumber, terminal, and gate are required' });
-  }
+const createFlightValidation = [
+  body('airlineCode').trim().notEmpty().withMessage('airlineCode is required')
+    .isLength({ min: 2, max: 3 }).withMessage('airlineCode must be 2-3 characters')
+    .isAlpha().withMessage('airlineCode must contain only letters'),
+  body('flightNumber').notEmpty().withMessage('flightNumber is required')
+    .isInt({ min: 1, max: 32767 }).withMessage('flightNumber must be a positive integer'),
+  body('destination').optional({ nullable: true }).trim()
+    .isLength({ max: 100 }).withMessage('destination too long')
+    .matches(/^[A-Za-z\s,.-]*$/).withMessage('destination contains invalid characters'),
+  body('terminal').trim().notEmpty().withMessage('terminal is required')
+    .isLength({ max: 10 }).withMessage('terminal too long'),
+  body('gate').trim().notEmpty().withMessage('gate is required')
+    .isLength({ max: 10 }).withMessage('gate too long'),
+];
 
+router.post('/', authenticate, authorize('administrator'), createFlightValidation, async (req, res) => {
+  const err = validate(req, res);
+  if (err) return;
+
+  const { airlineCode, flightNumber, destination, terminal, gate } = req.body;
   const code = String(airlineCode).trim().toUpperCase();
   const num = Number(flightNumber);
-  if (!Number.isInteger(num) || num < 1 || num > 32767) {
-    return res.status(400).json({ error: 'flightNumber must be a positive integer (smallint)' });
-  }
 
   try {
     const { rowCount: airlineExists } = await pool.query(
@@ -117,11 +135,21 @@ router.delete('/:id', authenticate, authorize('administrator'), async (req, res)
   }
 });
 
-router.patch('/:id/gate', authenticate, authorize('administrator', 'gate_staff', 'airline_staff'), async (req, res) => {
+const updateGateValidation = [
+  body('terminal').trim().notEmpty().withMessage('terminal is required')
+    .isLength({ max: 10 }).withMessage('terminal too long'),
+  body('gate').trim().notEmpty().withMessage('gate is required')
+    .isLength({ max: 10 }).withMessage('gate too long'),
+];
+
+router.patch('/:id/gate', authenticate, authorize('administrator', 'gate_staff', 'airline_staff'), updateGateValidation, async (req, res) => {
   const parsed = parseFlightId(req.params.id);
   if (!parsed) return res.status(400).json({ error: 'Invalid flight id' });
+
+  const err = validate(req, res);
+  if (err) return;
+
   const { terminal, gate } = req.body;
-  if (!terminal || !gate) return res.status(400).json({ error: 'terminal and gate are required' });
 
   try {
     const conflict = await pool.query(

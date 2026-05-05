@@ -1,9 +1,17 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const { body, validationResult } = require('express-validator');
 const { pool, flightId } = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
+const { securityLog } = require('../middleware/logger');
 
 const router = express.Router();
+
+function validate(req, res) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
+  return null;
+}
 
 function generateUsername(lastName) {
   const namePart = String(lastName || '').toLowerCase().replace(/[^a-z]/g, '') || 'user';
@@ -57,17 +65,32 @@ router.get('/', authenticate, authorize('administrator'), async (req, res) => {
   }
 });
 
-router.post('/', authenticate, authorize('administrator'), async (req, res) => {
+const createStaffValidation = [
+  body('firstName').trim().notEmpty().withMessage('firstName is required')
+    .isLength({ max: 50 }).withMessage('firstName too long')
+    .matches(/^[A-Za-z\s'-]+$/).withMessage('firstName contains invalid characters'),
+  body('lastName').trim().notEmpty().withMessage('lastName is required')
+    .isLength({ max: 50 }).withMessage('lastName too long')
+    .matches(/^[A-Za-z\s'-]+$/).withMessage('lastName contains invalid characters'),
+  body('email').trim().notEmpty().withMessage('email is required')
+    .isEmail().withMessage('Invalid email address')
+    .isLength({ max: 100 }).withMessage('email too long'),
+  body('phone').optional({ nullable: true }).trim()
+    .matches(/^[0-9]{10}$/).withMessage('Phone must be exactly 10 digits'),
+  body('staffType').notEmpty().withMessage('staffType is required')
+    .isIn(['airline_staff', 'gate_staff', 'ground_staff']).withMessage('Invalid staffType'),
+  body('airlineCode').optional({ nullable: true }).trim()
+    .isLength({ max: 3 }).withMessage('airlineCode too long'),
+];
+
+router.post('/', authenticate, authorize('administrator'), createStaffValidation, async (req, res) => {
+  const err = validate(req, res);
+  if (err) return;
+
   const { firstName, lastName, email, phone, staffType, airlineCode } = req.body;
-  if (!firstName || !lastName || !staffType || !email) {
-    return res.status(400).json({ error: 'firstName, lastName, email, and staffType are required' });
-  }
 
   let code = airlineCode ? String(airlineCode).trim().toUpperCase() : null;
 
-  // Ground staff aren't conceptually tied to an airline, but Supabase's
-  // staff.airline_code is NOT NULL — fall back to the first available airline
-  // so the admin form can omit it for ground_staff.
   if (!code && staffType === 'ground_staff') {
     const { rows } = await pool.query('SELECT airline_code FROM airline ORDER BY airline_code LIMIT 1');
     if (rows.length === 0) return res.status(500).json({ error: 'No airlines exist; cannot create staff' });
@@ -99,8 +122,10 @@ router.post('/', authenticate, authorize('administrator'), async (req, res) => {
       `INSERT INTO staff (airline_code, username, firstname, lastname, email, phone, role)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [code, username, firstName, lastName, email, phone || null, staffType]
+      [code, username, firstName.trim(), lastName.trim(), email.trim(), phone || null, staffType]
     );
+
+    securityLog('STAFF_CREATED', { username, staffType, createdBy: req.user.username, ip: req.ip });
 
     res.status(201).json({
       ...row2staff(inserted[0], true),
@@ -122,6 +147,8 @@ router.delete('/:id', authenticate, authorize('administrator'), async (req, res)
 
     await pool.query('DELETE FROM staff WHERE staff_id = $1', [id]);
     await pool.query('DELETE FROM login WHERE username = $1', [username]);
+
+    securityLog('STAFF_DELETED', { username, deletedBy: req.user.username, ip: req.ip });
 
     res.json({ success: true });
   } catch (err) {

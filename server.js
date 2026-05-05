@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,6 +13,7 @@ const allowedOrigins = [
   'https://cs5336-project.vercel.app',
   ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL.replace(/\/$/, '')] : []),
 ];
+app.use(helmet());
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) callback(null, true);
@@ -19,6 +22,15 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+});
+app.use(globalLimiter);
 
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/flights', require('./routes/flights'));
