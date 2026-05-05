@@ -1,79 +1,167 @@
 const express = require('express');
-const { db, randomUUID } = require('../db');
+const { pool, flightId, parseFlightId, normalizeStatus } = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
 
 function row2flight(f) {
+  const code = f.airline_code ? f.airline_code.trim() : '';
   return {
-    id: f.id,
-    airlineName: f.airline_name,
-    airlineCode: f.airline_code,
-    flightNumber: f.flight_number,
-    destination: f.destination,
-    terminal: f.terminal,
-    gate: f.gate,
-    createdAt: f.created_at,
+    id: flightId(code, f.flight_number),
+    airlineName: f.airline_name || null,
+    airlineCode: code,
+    flightNumber: String(f.flight_number),
+    destination: f.destination || null,
+    terminal: f.terminal || null,
+    gate: f.gate_number || null,
+    status: normalizeStatus(f.status),
   };
 }
 
-router.get('/', authenticate, (req, res) => {
-  const flights = db.prepare('SELECT * FROM flights ORDER BY created_at DESC').all();
-  res.json(flights.map(row2flight));
+const SELECT_FLIGHT = `
+  SELECT f.*, a.airline_name
+  FROM flight f
+  LEFT JOIN airline a ON a.airline_code = f.airline_code
+`;
+
+router.get('/', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(SELECT_FLIGHT + ' ORDER BY f.airline_code, f.flight_number');
+    res.json(rows.map(row2flight));
+  } catch (err) {
+    console.error('flights GET error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.get('/:id', authenticate, (req, res) => {
-  const flight = db.prepare('SELECT * FROM flights WHERE id = ?').get(req.params.id);
-  if (!flight) return res.status(404).json({ error: 'Flight not found' });
-  res.json(row2flight(flight));
+router.get('/:id', authenticate, async (req, res) => {
+  const parsed = parseFlightId(req.params.id);
+  if (!parsed) return res.status(400).json({ error: 'Invalid flight id' });
+  try {
+    const { rows } = await pool.query(
+      SELECT_FLIGHT + ' WHERE f.airline_code = $1 AND f.flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Flight not found' });
+    res.json(row2flight(rows[0]));
+  } catch (err) {
+    console.error('flights GET/:id error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.post('/', authenticate, authorize('administrator'), (req, res) => {
-  const { airlineName, airlineCode, flightNumber, destination, terminal, gate } = req.body;
-
+router.post('/', authenticate, authorize('administrator'), async (req, res) => {
+  const { airlineCode, flightNumber, destination, terminal, gate } = req.body;
   if (!airlineCode || !flightNumber || !terminal || !gate) {
     return res.status(400).json({ error: 'airlineCode, flightNumber, terminal, and gate are required' });
   }
 
-  const duplicate = db.prepare(
-    'SELECT id FROM flights WHERE airline_code = ? AND flight_number = ?'
-  ).get(airlineCode, flightNumber);
-  if (duplicate) return res.status(409).json({ error: 'Flight already exists' });
+  const code = String(airlineCode).trim().toUpperCase();
+  const num = Number(flightNumber);
+  if (!Number.isInteger(num) || num < 1 || num > 32767) {
+    return res.status(400).json({ error: 'flightNumber must be a positive integer (smallint)' });
+  }
 
-  const gateOccupied = db.prepare(
-    'SELECT id FROM flights WHERE terminal = ? AND gate = ?'
-  ).get(terminal, gate);
-  if (gateOccupied) return res.status(409).json({ error: 'Gate already occupied by another flight' });
+  try {
+    const { rowCount: airlineExists } = await pool.query(
+      'SELECT 1 FROM airline WHERE airline_code = $1',
+      [code]
+    );
+    if (!airlineExists) return res.status(400).json({ error: `Unknown airline code: ${code}` });
 
-  const id = randomUUID();
-  db.prepare(
-    'INSERT INTO flights (id, airline_name, airline_code, flight_number, destination, terminal, gate) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, airlineName || null, airlineCode, flightNumber, destination || null, terminal, gate);
+    const dup = await pool.query(
+      'SELECT 1 FROM flight WHERE airline_code = $1 AND flight_number = $2',
+      [code, num]
+    );
+    if (dup.rowCount) return res.status(409).json({ error: 'Flight already exists' });
 
-  res.status(201).json(row2flight(db.prepare('SELECT * FROM flights WHERE id = ?').get(id)));
+    const occupied = await pool.query(
+      'SELECT 1 FROM flight WHERE terminal = $1 AND gate_number = $2',
+      [terminal, gate]
+    );
+    if (occupied.rowCount) return res.status(409).json({ error: 'Gate already occupied by another flight' });
+
+    await pool.query(
+      `INSERT INTO flight (airline_code, flight_number, destination, terminal, gate_number, status)
+       VALUES ($1, $2, $3, $4, $5, 'Scheduled')`,
+      [code, num, destination || null, terminal, gate]
+    );
+
+    const { rows } = await pool.query(
+      SELECT_FLIGHT + ' WHERE f.airline_code = $1 AND f.flight_number = $2',
+      [code, num]
+    );
+    res.status(201).json(row2flight(rows[0]));
+  } catch (err) {
+    console.error('flights POST error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.delete('/:id', authenticate, authorize('administrator'), (req, res) => {
-  const result = db.prepare('DELETE FROM flights WHERE id = ?').run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Flight not found' });
-  res.json({ success: true });
+router.delete('/:id', authenticate, authorize('administrator'), async (req, res) => {
+  const parsed = parseFlightId(req.params.id);
+  if (!parsed) return res.status(400).json({ error: 'Invalid flight id' });
+  try {
+    const result = await pool.query(
+      'DELETE FROM flight WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Flight not found' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('flights DELETE error:', err);
+    if (err.code === '23503') {
+      return res.status(409).json({ error: 'Cannot delete: flight has associated passengers, bags, or staff' });
+    }
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.patch('/:id/gate', authenticate, authorize('administrator', 'gate_staff', 'airline_staff'), (req, res) => {
+router.patch('/:id/gate', authenticate, authorize('administrator', 'gate_staff', 'airline_staff'), async (req, res) => {
+  const parsed = parseFlightId(req.params.id);
+  if (!parsed) return res.status(400).json({ error: 'Invalid flight id' });
   const { terminal, gate } = req.body;
   if (!terminal || !gate) return res.status(400).json({ error: 'terminal and gate are required' });
 
-  const occupied = db.prepare(
-    'SELECT id FROM flights WHERE terminal = ? AND gate = ? AND id != ?'
-  ).get(terminal, gate, req.params.id);
-  if (occupied) return res.status(409).json({ error: 'Gate already occupied by another flight' });
+  try {
+    const conflict = await pool.query(
+      `SELECT 1 FROM flight
+       WHERE terminal = $1 AND gate_number = $2
+         AND NOT (airline_code = $3 AND flight_number = $4)`,
+      [terminal, gate, parsed.airlineCode, parsed.flightNumber]
+    );
+    if (conflict.rowCount) return res.status(409).json({ error: 'Gate already occupied by another flight' });
 
-  const result = db.prepare(
-    'UPDATE flights SET terminal = ?, gate = ? WHERE id = ?'
-  ).run(terminal, gate, req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Flight not found' });
+    const before = await pool.query(
+      'SELECT terminal, gate_number FROM flight WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    if (before.rowCount === 0) return res.status(404).json({ error: 'Flight not found' });
+    const prev = before.rows[0];
 
-  res.json(row2flight(db.prepare('SELECT * FROM flights WHERE id = ?').get(req.params.id)));
+    await pool.query(
+      `UPDATE flight SET terminal = $1, gate_number = $2
+       WHERE airline_code = $3 AND flight_number = $4`,
+      [terminal, gate, parsed.airlineCode, parsed.flightNumber]
+    );
+
+    if (req.user.staffId) {
+      await pool.query(
+        `INSERT INTO flight_gate_history (airline_code, flight_number, old_terminal, old_gate, new_terminal, new_gate, changed_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [parsed.airlineCode, parsed.flightNumber, prev.terminal, prev.gate_number, terminal, gate, req.user.staffId]
+      );
+    }
+
+    const { rows } = await pool.query(
+      SELECT_FLIGHT + ' WHERE f.airline_code = $1 AND f.flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    res.json(row2flight(rows[0]));
+  } catch (err) {
+    console.error('flights PATCH error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 module.exports = router;

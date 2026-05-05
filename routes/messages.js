@@ -1,48 +1,82 @@
 const express = require('express');
-const { db, randomUUID } = require('../db');
+const { pool } = require('../db');
 const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
 
+const METADATA_FIELDS = ['bagId', 'passengerId', 'passengerName', 'flightInfo', 'flightId'];
+
 function row2message(m) {
+  const meta = m.metadata || {};
   return {
-    id: m.id,
+    id: m.message_id,
     boardType: m.board_type,
-    staffId: m.staff_id,
-    staffName: m.staff_name,
-    airlineCode: m.airline_code,
-    senderRole: m.sender_role,
+    staffId: m.sender_id,
+    staffName: m.sender_name,
+    senderRole: m.sender_type,
+    airlineCode: m.airline_code ? m.airline_code.trim() : null,
     messageType: m.message_type,
-    content: m.content,
+    content: m.content || m.body || '',
+    bagId: meta.bagId || null,
+    passengerId: meta.passengerId || null,
+    passengerName: meta.passengerName || null,
+    flightInfo: meta.flightInfo || null,
+    flightId: meta.flightId || null,
     createdAt: m.created_at,
   };
 }
 
-router.get('/', authenticate, (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   const { boardType } = req.query;
-  const rows = boardType
-    ? db.prepare('SELECT * FROM messages WHERE board_type = ? ORDER BY created_at DESC').all(boardType)
-    : db.prepare('SELECT * FROM messages ORDER BY created_at DESC').all();
-  res.json(rows.map(row2message));
+  try {
+    const sql = boardType
+      ? 'SELECT * FROM message WHERE board_type = $1 ORDER BY created_at DESC'
+      : 'SELECT * FROM message ORDER BY created_at DESC';
+    const { rows } = await pool.query(sql, boardType ? [boardType] : []);
+    res.json(rows.map(row2message));
+  } catch (err) {
+    console.error('messages GET error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.post('/', authenticate, (req, res) => {
-  const { boardType, staffId, staffName, airlineCode, senderRole, messageType, content } = req.body;
-
+router.post('/', authenticate, async (req, res) => {
+  const { boardType, senderName, senderRole, airlineCode, messageType, content } = req.body;
   if (!boardType || !content) {
     return res.status(400).json({ error: 'boardType and content are required' });
   }
-  if (content.length > 500) {
+  if (String(content).length > 500) {
     return res.status(400).json({ error: 'Message content cannot exceed 500 characters' });
   }
+  if (!req.user.staffId) {
+    return res.status(403).json({ error: 'Only staff members can post messages' });
+  }
 
-  const id = randomUUID();
-  db.prepare(`
-    INSERT INTO messages (id, board_type, staff_id, staff_name, airline_code, sender_role, message_type, content)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, boardType, staffId || null, staffName || null, airlineCode || null, senderRole || null, messageType || null, content);
+  const metadata = {};
+  for (const k of METADATA_FIELDS) if (req.body[k] != null) metadata[k] = req.body[k];
 
-  res.status(201).json(row2message(db.prepare('SELECT * FROM messages WHERE id = ?').get(id)));
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO message
+         (sender_id, sender_type, sender_name, airline_code, board_type, message_type, content, body, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
+       RETURNING *`,
+      [
+        req.user.staffId,
+        senderRole || req.user.role,
+        senderName || null,
+        airlineCode || null,
+        boardType,
+        messageType || null,
+        content,
+        Object.keys(metadata).length ? metadata : null,
+      ]
+    );
+    res.status(201).json(row2message(rows[0]));
+  } catch (err) {
+    console.error('messages POST error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 module.exports = router;

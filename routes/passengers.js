@@ -1,72 +1,134 @@
 const express = require('express');
-const { db, randomUUID } = require('../db');
+const { pool, flightId, parseFlightId, normalizeStatus } = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
 
 function row2passenger(p) {
+  const code = p.airline_code ? p.airline_code.trim() : '';
   return {
-    id: p.id,
-    firstName: p.first_name,
-    lastName: p.last_name,
+    id: p.ticket_number,
+    firstName: p.firstname,
+    lastName: p.lastname,
     identification: p.identification,
     ticketNumber: p.ticket_number,
-    flightId: p.flight_id,
-    status: p.status,
-    createdAt: p.created_at,
+    flightId: flightId(code, p.flight_number),
+    airlineCode: code,
+    flightNumber: String(p.flight_number),
+    status: normalizeStatus(p.status),
   };
 }
 
-router.get('/', authenticate, (req, res) => {
-  const { flightId } = req.query;
-  const rows = flightId
-    ? db.prepare('SELECT * FROM passengers WHERE flight_id = ? ORDER BY created_at').all(flightId)
-    : db.prepare('SELECT * FROM passengers ORDER BY created_at DESC').all();
-  res.json(rows.map(row2passenger));
+router.get('/', authenticate, async (req, res) => {
+  const { flightId: queryFlightId } = req.query;
+  try {
+    if (queryFlightId) {
+      const parsed = parseFlightId(queryFlightId);
+      if (!parsed) return res.status(400).json({ error: 'Invalid flightId' });
+      const { rows } = await pool.query(
+        'SELECT * FROM passenger WHERE airline_code = $1 AND flight_number = $2 ORDER BY lastname, firstname',
+        [parsed.airlineCode, parsed.flightNumber]
+      );
+      return res.json(rows.map(row2passenger));
+    }
+    const { rows } = await pool.query(
+      'SELECT * FROM passenger ORDER BY airline_code, flight_number, lastname, firstname'
+    );
+    res.json(rows.map(row2passenger));
+  } catch (err) {
+    console.error('passengers GET error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.get('/:id', authenticate, (req, res) => {
-  const passenger = db.prepare('SELECT * FROM passengers WHERE id = ?').get(req.params.id);
-  if (!passenger) return res.status(404).json({ error: 'Passenger not found' });
-  res.json(row2passenger(passenger));
+router.get('/:id', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM passenger WHERE ticket_number = $1',
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Passenger not found' });
+    res.json(row2passenger(rows[0]));
+  } catch (err) {
+    console.error('passengers GET/:id error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.post('/', authenticate, authorize('administrator', 'airline_staff'), (req, res) => {
-  const { firstName, lastName, identification, ticketNumber, flightId } = req.body;
-
-  if (!firstName || !lastName || !identification || !ticketNumber || !flightId) {
+router.post('/', authenticate, authorize('administrator', 'airline_staff'), async (req, res) => {
+  const { firstName, lastName, identification, ticketNumber, flightId: bodyFlightId } = req.body;
+  if (!firstName || !lastName || !identification || !ticketNumber || !bodyFlightId) {
     return res.status(400).json({ error: 'All fields are required' });
   }
+  const parsed = parseFlightId(bodyFlightId);
+  if (!parsed) return res.status(400).json({ error: 'Invalid flightId' });
 
-  const existing = db.prepare('SELECT id FROM passengers WHERE ticket_number = ?').get(ticketNumber);
-  if (existing) return res.status(409).json({ error: 'Ticket number already exists' });
+  try {
+    const flight = await pool.query(
+      'SELECT 1 FROM flight WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    if (flight.rowCount === 0) return res.status(404).json({ error: 'Flight not found' });
 
-  const flight = db.prepare('SELECT id FROM flights WHERE id = ?').get(flightId);
-  if (!flight) return res.status(404).json({ error: 'Flight not found' });
+    const dup = await pool.query(
+      'SELECT 1 FROM passenger WHERE ticket_number = $1',
+      [ticketNumber]
+    );
+    if (dup.rowCount) return res.status(409).json({ error: 'Ticket number already exists' });
 
-  const id = randomUUID();
-  db.prepare(
-    "INSERT INTO passengers (id, first_name, last_name, identification, ticket_number, flight_id, status) VALUES (?, ?, ?, ?, ?, ?, 'not_checked_in')"
-  ).run(id, firstName, lastName, identification, ticketNumber, flightId);
+    await pool.query(
+      `INSERT INTO passenger (identification, airline_code, flight_number, ticket_number, firstname, lastname, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'not_checked_in')`,
+      [identification, parsed.airlineCode, parsed.flightNumber, ticketNumber, firstName, lastName]
+    );
 
-  res.status(201).json(row2passenger(db.prepare('SELECT * FROM passengers WHERE id = ?').get(id)));
+    const { rows } = await pool.query(
+      'SELECT * FROM passenger WHERE ticket_number = $1',
+      [ticketNumber]
+    );
+    res.status(201).json(row2passenger(rows[0]));
+  } catch (err) {
+    console.error('passengers POST error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.delete('/:id', authenticate, authorize('administrator'), (req, res) => {
-  const result = db.prepare('DELETE FROM passengers WHERE id = ?').run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Passenger not found' });
-  res.json({ success: true });
+router.delete('/:id', authenticate, authorize('administrator'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM passenger WHERE ticket_number = $1',
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Passenger not found' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('passengers DELETE error:', err);
+    if (err.code === '23503') {
+      return res.status(409).json({ error: 'Cannot delete: passenger has associated bags' });
+    }
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
-router.patch('/:id/status', authenticate, authorize('administrator', 'airline_staff', 'gate_staff'), (req, res) => {
+router.patch('/:id/status', authenticate, authorize('administrator', 'airline_staff', 'gate_staff'), async (req, res) => {
   const { status } = req.body;
-  const valid = ['not_checked_in', 'checked_in', 'boarded'];
+  const valid = ['not_checked_in', 'checked_in', 'boarded', 'removed'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
-
-  const result = db.prepare('UPDATE passengers SET status = ? WHERE id = ?').run(status, req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Passenger not found' });
-
-  res.json(row2passenger(db.prepare('SELECT * FROM passengers WHERE id = ?').get(req.params.id)));
+  try {
+    const result = await pool.query(
+      'UPDATE passenger SET status = $1 WHERE ticket_number = $2',
+      [status, req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Passenger not found' });
+    const { rows } = await pool.query(
+      'SELECT * FROM passenger WHERE ticket_number = $1',
+      [req.params.id]
+    );
+    res.json(row2passenger(rows[0]));
+  } catch (err) {
+    console.error('passengers PATCH error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 module.exports = router;

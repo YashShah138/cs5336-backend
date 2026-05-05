@@ -1,7 +1,7 @@
 {
   "name": "cs5336-backend",
   "version": "1.0.0",
-  "description": "Airport Management System – Express/SQLite backend",
+  "description": "Airport Management System – Express + Supabase Postgres backend",
   "main": "server.js",
   "scripts": {
     "dev": "node --watch server.js",
@@ -10,10 +10,13 @@
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^12.9.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }
