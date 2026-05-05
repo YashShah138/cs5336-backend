@@ -120,11 +120,48 @@ router.delete('/:id', authenticate, authorize('administrator'), async (req, res)
   const parsed = parseFlightId(req.params.id);
   if (!parsed) return res.status(400).json({ error: 'Invalid flight id' });
   try {
-    const result = await pool.query(
+    const { rows: flightRows } = await pool.query(
+      'SELECT 1 FROM flight WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    if (flightRows.length === 0) return res.status(404).json({ error: 'Flight not found' });
+
+    // Check all passengers are boarded or removed
+    const { rows: notBoardedRows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM passenger
+       WHERE airline_code = $1 AND flight_number = $2
+         AND status NOT IN ('boarded', 'removed')`,
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    const notBoardedCount = notBoardedRows[0].count;
+    if (notBoardedCount > 0) {
+      return res.status(409).json({
+        error: `Cannot depart: ${notBoardedCount} passenger(s) have not boarded yet`,
+        notBoardedCount,
+      });
+    }
+
+    // Check all bags belonging to non-removed passengers are loaded
+    const { rows: notLoadedRows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM bag b
+       JOIN passenger p ON p.ticket_number = b.ticket_number
+       WHERE b.airline_code = $1 AND b.flight_number = $2
+         AND p.status != 'removed'
+         AND b.status != 'loaded'`,
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    const notLoadedCount = notLoadedRows[0].count;
+    if (notLoadedCount > 0) {
+      return res.status(409).json({
+        error: `Cannot depart: ${notLoadedCount} bag(s) have not been loaded yet`,
+        notLoadedCount,
+      });
+    }
+
+    await pool.query(
       'DELETE FROM flight WHERE airline_code = $1 AND flight_number = $2',
       [parsed.airlineCode, parsed.flightNumber]
     );
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Flight not found' });
     res.json({ success: true });
   } catch (err) {
     console.error('flights DELETE error:', err);
