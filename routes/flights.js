@@ -159,6 +159,20 @@ router.delete('/:id', authenticate, authorize('administrator'), async (req, res)
     }
 
     await pool.query(
+      `DELETE FROM bag_location_history WHERE bag_id IN (
+         SELECT bag_id FROM bag WHERE airline_code = $1 AND flight_number = $2
+       )`,
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    await pool.query(
+      'DELETE FROM bag WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    await pool.query(
+      'DELETE FROM passenger WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    await pool.query(
       'DELETE FROM flight WHERE airline_code = $1 AND flight_number = $2',
       [parsed.airlineCode, parsed.flightNumber]
     );
