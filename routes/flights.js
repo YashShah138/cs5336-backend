@@ -173,6 +173,14 @@ router.delete('/:id', authenticate, authorize('administrator'), async (req, res)
       [parsed.airlineCode, parsed.flightNumber]
     );
     await pool.query(
+      'DELETE FROM flight_gate_history WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    await pool.query(
+      'UPDATE staff SET flight_number = NULL WHERE airline_code = $1 AND flight_number = $2',
+      [parsed.airlineCode, parsed.flightNumber]
+    );
+    await pool.query(
       'DELETE FROM flight WHERE airline_code = $1 AND flight_number = $2',
       [parsed.airlineCode, parsed.flightNumber]
     );
