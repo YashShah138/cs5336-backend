@@ -14,7 +14,7 @@ const STAFF_ROLES = ['airline_staff', 'gate_staff', 'ground_staff'];
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts, please try again in 15 minutes' },
