@@ -29,10 +29,18 @@ function row2message(m) {
 router.get('/', authenticate, async (req, res) => {
   const { boardType } = req.query;
   try {
-    const sql = boardType
-      ? 'SELECT * FROM message WHERE board_type = $1 ORDER BY created_at DESC'
-      : 'SELECT * FROM message ORDER BY created_at DESC';
-    const { rows } = await pool.query(sql, boardType ? [boardType] : []);
+    let sql, params;
+    if (boardType === 'airline' && req.user.airlineCode) {
+      sql = 'SELECT * FROM message WHERE board_type = $1 AND (airline_code = $2 OR airline_code IS NULL) ORDER BY created_at DESC';
+      params = [boardType, req.user.airlineCode];
+    } else if (boardType) {
+      sql = 'SELECT * FROM message WHERE board_type = $1 ORDER BY created_at DESC';
+      params = [boardType];
+    } else {
+      sql = 'SELECT * FROM message ORDER BY created_at DESC';
+      params = [];
+    }
+    const { rows } = await pool.query(sql, params);
     res.json(rows.map(row2message));
   } catch (err) {
     console.error('messages GET error:', err);
